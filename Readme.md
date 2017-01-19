@@ -11,6 +11,7 @@ Required software:
 * BioPython (https://github.com/biopython/biopython.github.io/)
 * path (https://pypi.python.org/pypi/forked-path)
 
+```
 usage: repset.py [-h] --outdir OUTDIR --seqs SEQS [--mixture MIXTURE]
 
 optional arguments:
@@ -19,5 +20,6 @@ optional arguments:
   --seqs SEQS        Input sequences, fasta format
   --mixture MIXTURE  Mixture parameter determining the relative weight of
                          facility-location relative to sum-redundancy. Default=0.5
+```
 
 Output: Ordered list of sequence idenifiers, as defined in the input fasta file. The top N ids in this file represent the chosen representative set of size N.
