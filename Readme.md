@@ -9,16 +9,12 @@ Required software:
 * BioPython (https://github.com/biopython/biopython.github.io/)
 * path (https://pypi.python.org/pypi/forked-path)
 
-    usage: repset.py [-h] --outdir OUTDIR --seqs SEQS [--mixture MIXTURE]
-    
-    optional arguments:
-      -h, --help         show this help message and exit
-      --outdir OUTDIR    Output directory
-      --seqs SEQS        Input sequences, fasta format
-      --mixture MIXTURE  Mixture parameter determining the relative weight of
+```usage: repset.py [-h] --outdir OUTDIR --seqs SEQS [--mixture MIXTURE]
+
+optional arguments:
+  -h, --help         show this help message and exit
+  --outdir OUTDIR    Output directory
+  --seqs SEQS        Input sequences, fasta format
+  --mixture MIXTURE  Mixture parameter determining the relative weight of
                          facility-location relative to sum-redundancy. Default=0.5
-
-
-
-
-
+```
