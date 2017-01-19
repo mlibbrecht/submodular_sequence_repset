@@ -1,328 +1,136 @@
 #!/bin/env python
+
 import sys
 import os
 import argparse
 import subprocess
 import gzip
-import heapq
 import math
 import random
 from path import path
 from collections import defaultdict
 import bedtools
-import time
-import numpy
-import pickle
+import shutil
 import copy
+import os
+import math
+import heapq
 import sklearn.cluster
 import scipy.sparse
 import resource
 
-import mysql.connector
+from Bio import SeqIO
 
-##################################
-# logging
+
+###############################################################
+###############################################################
+# Input and processing
+###############################################################
+###############################################################
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--outdir", type=path, required=True, help="Output directory")
+parser.add_argument("--seqs", type=path, required=True, help="Input sequences, fasta format")
+parser.add_argument("--mixture", type=float, default=0.5, help="Mixture parameter determining the relative weight of facility-location relative to sum-redundancy. Default=0.5")
+args = parser.parse_args()
+workdir = args.outdir
+
+assert args.mixture >= 0.0
+assert args.mixture <= 1.0
+
+
+if not workdir.exists():
+    workdir.makedirs()
+
 import logging
+logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s")
 logger = logging.getLogger('log')
-##################################
+logger.setLevel(logging.DEBUG)
+# create file handler which logs even debug messages
+fh = logging.FileHandler(workdir / "stdout.txt")
+fh.setLevel(logging.DEBUG) # >> this determines the file level
+# create console handler with a higher log level
+ch = logging.StreamHandler()
+ch.setLevel(logging.ERROR)# >> this determines the output level
+# create formatter and add it to the handlers
+formatter = logging.Formatter('%(asctime)s %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+fh.setFormatter(formatter)
+# add the handlers to logger
+logger.addHandler(ch)
+logger.addHandler(fh)
 
-scop_level_names = {
-    1: "Root",
-    2: "Class",
-    3: "Fold",
-    4: "Superfamily",
-    5: "Family",
-    6: "Protein",
-    7: "Species",
-    8: "PDB Entry Domain"
-}
 
-#############################
-# Read astral from database
-# - class_id: Restrict results to a particular SCOP Class (level 2). None for no restriction.
-# - max_ids: Restrict results to max_ids ids. If class_id is also specified, will restrict number
-#      of ids first, so will result in many fewer than max_ids returned.
-# Returns:
-# astral: {seq_id: {
+
+###################
+# Run psiblast
+###################
+if not (workdir / "db").exists():
+    cmd = ["makeblastdb",
+      "-in", args.seqs,
+      "-input_type", "fasta",
+      "-out", workdir / "db",
+      "-dbtype", "prot"]
+    logger.info(" ".join(cmd))
+    subprocess.check_call(cmd)
+
+if not (workdir / "psiblast_result.tab").exists():
+    cmd = ["psiblast",
+      "-query", args.seqs,
+      "-db", workdir / "db",
+      "-num_iterations", "6",
+      "-outfmt", "6 qseqid sseqid pident length mismatch evalue bitscore",
+      "-seg", "yes",
+      "-out", workdir / "psiblast_result.tab"
+    ]
+    logger.info(" ".join(cmd))
+    subprocess.check_call(cmd)
+
+###################
+# Read psiblast output
+###################
+
+db = {}
+# db: {seq_id: {
 #               "neighbors": {neighbor_seq_id: {"log10_e": -9999.0, "pct_identical": 100.0}},
+#               "in_neighbors": {neighbor_seq_id: {"log10_e": -9999.0, "pct_identical": 100.0}},
 #               "scop": {level_id: [scop_ids]},
 #               "seq": ""
 #             }
 #         }
-#############################
-def read_astral_database(class_id=None, max_ids=None):
-    raise Exception("TODO: do not symmetrize; add in_neighbors instead")
-    time_before = time.time()
-    def connect_db(connect_timeout=30):
-        cnx = mysql.connector.connect(host="guanine.gs.washington.edu",
-                                      user="root",
-                                      port=3306,
-                                      connect_timeout=connect_timeout,
-                                      buffered=True,
-                                      get_warnings=True,
-                                      raise_on_warnings=True)
 
-        cursor = cnx.cursor(dictionary=True)
-        cursor.execute("USE scop")
-        return cnx, cursor
+fasta_sequences = SeqIO.parse(open(args.seqs),'fasta')
+for seq in fasta_sequences:
+    seq_id = seq.id
+    db[seq_id] = {"neighbors": {}, "in_neighbors": {}, "seq": seq.seq}
 
-    cnx, cursor = connect_db(connect_timeout=1200)
+with open(workdir / "psiblast_result.tab", "r") as f:
+    for line in f:
+        if line.strip() == "": continue
+        if line.startswith("Search has CONVERGED!"): continue
+        line = line.split()
+        seq_id1 = line[0]
+        seq_id2 = line[1]
+        pident = float(line[2])
+        evalue = line[5]
+        log10_e = math.log10(float(evalue))
+        if float(evalue) <= 1e-2:
+            db[seq_id2]["neighbors"][seq_id1] = {"log10_e": log10_e, "pct_identical": pident}
+            db[seq_id1]["in_neighbors"][seq_id2] = {"log10_e": log10_e, "pct_identical": pident}
 
-    # is this necessary?
-    query ="SET GLOBAL max_allowed_packet=33554432"
-    logger.info(query)
-    cursor.execute(query)
-
-    query ="SET GLOBAL net_read_timeout=3600"
-    logger.info(query)
-    cursor.execute(query)
-
-    query ="SET GLOBAL net_write_timeout=3600"
-    logger.info(query)
-    cursor.execute(query)
-
-    query ="SET GLOBAL connect_timeout=3600"
-    logger.info(query)
-    cursor.execute(query)
-
-    query ="SET GLOBAL innodb_lock_wait_timeout=3600"
-    logger.info(query)
-    cursor.execute(query)
-
-    query ="SET GLOBAL innodb_flush_log_at_timeout=2000"
-    logger.info(query)
-    cursor.execute(query)
-
-    #############################
-    # Read astral ids
-    #############################
-    logger.info("Starting reading astral ids...")
-    if not (max_ids is None):
-        assert(max_ids > 0)
-        query = "SELECT id AS astral_seq_id, seq FROM astral_seq ORDER BY RAND() LIMIT {max_ids}".format(**locals())
-    else:
-        query = "SELECT id AS astral_seq_id, seq FROM astral_seq"
-
-    logger.info(query)
-    time_before = time.time()
-    cursor.execute(query)
-    astral = {row["astral_seq_id"]: {"seq": row["seq"]} for row in cursor}
-
-    logger.info("Time to read astral ids: %s", time.time()-time_before )
-
-
-    #############################
-    # Read SCOP classes
-    #############################
-    logger.info("Starting reading SCOP classes...")
-    time_before = time.time()
-    query = """
-SELECT t1.seq_id, t1.domain_id, t1.node_id, scop_node.release_id, scop_node.level_id FROM
-(
-    SELECT astral_seq.id AS seq_id, astral_domain.id AS domain_id, astral_domain.node_id AS node_id
-    FROM astral_seq
-    LEFT JOIN astral_domain ON astral_seq.id = astral_domain.seq_id
-    WHERE astral_seq.id IN ({astral_ids_str})
-) as t1
-LEFT JOIN scop_node ON t1.node_id = scop_node.id
-""".format(astral_ids_str=",".join(map(str, astral.keys())))
-    time_before_query = time.time()
-    cursor.execute(query)
-
-    # nodes_by_level: {scop_level: {seq_id: [scop_id]}}
-    nodes_by_level = {scop_level: {} for scop_level in range(1,9)}
-    num_level1 = 0
-    num_total = 0
-    for row in cursor:
-        if not ((row["level_id"] is None) or (row["level_id"] == 8)):
-            num_level1 += 1
-            num_total += 1
-            continue
-
-        if not (row["seq_id"] in nodes_by_level[8]):
-            nodes_by_level[8][row["seq_id"]] = set()
-        if row["release_id"] == 15:
-            nodes_by_level[8][row["seq_id"]].add(row["node_id"])
-            num_total += 1
-    logger.warning("Number of weird level-1-associated astral domains: %s / %s", num_level1, num_total)
-    logger.info("Time to read level-8 SCOP: %s", time.time()-time_before )
-
-    # Recursively get level 7-1 nodes
-    for scop_level in range(7,0,-1):
-        logger.info("Starting level %s...", scop_level)
-        query_nodes = set.union(*nodes_by_level[scop_level+1].values())
-        if len(query_nodes) == 0:
-            nodes_by_level[scop_level] = {seq_id: set() for seq_id in nodes_by_level[scop_level+1]}
-        else:
-            query = """
-SELECT id AS node_id, level_id, parent_node_id, description, release_id FROM
-scop_node
-WHERE id IN ({query_nodes_str}) AND release_id = 15
-""".format(query_nodes_str=",".join(map(str,query_nodes)))
-            cursor.execute(query)
-
-            nodes_reverse_index = {} # {node_id: [seq_id]}
-            for seq_id, node_list in nodes_by_level[scop_level+1].items():
-                for node_id in node_list:
-                    if not (node_id in nodes_reverse_index):
-                        nodes_reverse_index[node_id] = []
-                    nodes_reverse_index[node_id].append(seq_id)
-
-            nodes_by_level[scop_level] = {seq_id: set() for seq_id in nodes_by_level[scop_level+1]}
-            for row in cursor:
-                for seq_id in nodes_reverse_index[row["node_id"]]:
-                    nodes_by_level[scop_level][seq_id].add(row["parent_node_id"])
-
-    # convert nodes_by_level to seq_id-centric structure
-    num_skipped = 0
-    total = 0
-    for scop_level_id in nodes_by_level:
-        for seq_id in nodes_by_level[scop_level_id]:
-            if seq_id in astral:
-                if not "scop" in astral[seq_id]:
-                    astral[seq_id]["scop"] = {}
-                astral[seq_id]["scop"][scop_level_id] = nodes_by_level[scop_level_id][seq_id]
-            else:
-                num_skipped += 1
-            total += 1
-    logger.info("Converting nodes_by_level to seq_id-centric form: Skipped %s/%s entries", num_skipped, num_total)
-    logger.info("Time to read SCOP: %s", time.time()-time_before )
-
-    #############################
-    # Remove sequences with no release-15 level-5 class and restrict to class_id
-    #############################
-    logger.info("Number of sequences before removing: %s", len(astral))
-    astral = {seq_id: x for seq_id, x in astral.items() if
-              ("scop" in x and len(x["scop"][5]) >= 1)}
-
-    if not (class_id is None):
-        astral = {seq_id: x for seq_id, x in astral.items() if
-                  class_id in x["scop"][2] }
-    logger.info("Number of sequences after removing: %s", len(astral))
-
-
-    #############################
-    # Read BLAST graph
-    #############################
-    logger.info("Starting reading BLAST graph...")
-    time_before = time.time()
-    for seq_id in astral: astral[seq_id]["neighbors"] = {}
-
-    # add self-edges
-    for seq_id in astral:
-        astral[seq_id]["neighbors"][seq_id] = {"log10_e": -9999.0, "pct_identical": 100.0}
-
-    # For some reason, there seems to be a limit on the number of rows I can get in a query
-    # I'm sure there's a right way to do this, but I can't figure it out.
-    # Instead, I'm just going to break up my queries into chunks.
-    chunk_size = 10
-    cnx, cursor = connect_db(connect_timeout=10)
-    #for chunk_start in range(0, len(astral), chunk_size):
-    chunk_start = 0
-    chunk_end = chunk_start + chunk_size
-    while chunk_start < len(astral.keys()):
-        logger.info("Starting chunk %s-%s / %s", chunk_start, chunk_end, len(astral))
-        #astral_ids_chunk = astral.keys()[chunk_start:min(chunk_start+chunk_size,len(astral.keys()))]
-        astral_ids_chunk = astral.keys()[chunk_start:chunk_end]
-
-        query = """
-SELECT seq1_id, seq2_id, blast_log10_e, pct_identical FROM astral_seq_blast
-WHERE seq1_id IN ({astral_ids_chunk_str}) AND seq2_id IN ({astral_ids_str}) AND release_id = 15
-""".format(astral_ids_chunk_str=",".join(map(str, astral_ids_chunk)),
-           astral_ids_str=",".join(map(str, astral.keys())))
-        #logger.debug(query)
-        time_before_query = time.time()
-
-        try:
-            cursor.execute(query)
-            num_blast_rows = 0
-            for row_index, row in enumerate(cursor):
-                seq1_id = row["seq1_id"]
-                seq2_id = row["seq2_id"]
-                log10_e = row["blast_log10_e"]
-                pct_identical = row["pct_identical"]
-                assert(seq1_id in astral)
-                if seq2_id in astral:
-                    if seq2_id in astral[seq1_id]["neighbors"]:
-                        pass
-                        #if abs(log10_e - astral[seq1_id]["neighbors"][seq2_id]["log10_e"]) > 0.1:
-                            #logger.error("log10_e values to not match: %s vs. %s", log10_e, astral[seq1_id]["neighbors"][seq2_id]["log10_e"])
-                        #else:
-                            #logger.error("log10_e values match")
-                        #if abs(pct_identical - astral[seq1_id]["neighbors"][seq2_id]["pct_identical"]) > 0.1:
-                            #logger.error("pct_identical values to not match: %s vs. %s", pct_identical, astral[seq1_id]["neighbors"][seq2_id]["pct_identical"])
-                        #else:
-                            #logger.error("pct_identical values match")
-                    else:
-                        astral[seq1_id]["neighbors"][seq2_id] = {"log10_e": log10_e, "pct_identical": pct_identical}
-                        astral[seq2_id]["neighbors"][seq1_id] = {"log10_e": log10_e, "pct_identical": pct_identical}
-                num_blast_rows += 1
-            logger.debug("Time for query: %s (%s rows)", time.time()-time_before_query, num_blast_rows)
-            chunk_start = chunk_end
-            chunk_end = chunk_start + chunk_size
-        except mysql.connector.errors.OperationalError as e:
-            logger.warning("Ignoring error and renewing connection -- mysql.connector.errors.OperationalError: %s", e)
-            cnx, cursor = connect_db(connect_timeout=30)
-            chunk_end = chunk_start + ((chunk_end - chunk_start) // 2) + 1
-        except ValueError as e:
-            logger.warning("Ignoring error: %s", e)
-            cnx, cursor = connect_db(connect_timeout=30)
-        except IndexError as e:
-            logger.warning("Ignoring error: %s", e)
-            cnx, cursor = connect_db(connect_timeout=30)
-            chunk_end = chunk_start + ((chunk_end - chunk_start) // 2) + 1
-    logger.info("Time to read BLAST graph: %s", time.time()-time_before )
-
-    return astral
-
-# Try reading the database, starting over on failure
-def read_astral_database_retries(*args, **kwargs):
-    try:
-        read_astral_database(*args, **kwargs)
-    except Exception as e:
-        logger.critical("---- Ignoring error and restarting database read: %s ----", e)
-        read_astral_database_retries(*args, **kwargs)
-
-
-#############################
-# Synthetic astral-like database
-#############################
-def synthetic_astral(num_examples=100, num_centers=10):
-    astral = {i: {} for i in range(num_examples)}
-    # Add self-edges and filler seq and scop info
-    for i in astral:
-        astral[i]["seq"] = "AA"
-        astral[i]["neighbors"] = {i: {"log10_e": -9999.0, "pct_identical": 100.0}}
-        astral[i]["in_neighbors"] = {i: {"log10_e": -9999.0, "pct_identical": 100.0}}
-    for i in range(num_centers):
-        astral[i]["scop"] = {l:[str(i)] for l in scop_level_names}
-    for i in range(num_centers, num_examples):
-        # Add edge to a center
-        center_id = random.randrange(num_centers)
-        astral[i]["scop"] = astral[center_id]["scop"]
-        astral[i]["neighbors"][center_id] = {"log10_e": -9999.0, "pct_identical": 95.0}
-        astral[center_id]["in_neighbors"][i] = {"log10_e": -9999.0, "pct_identical": 95.0}
-        # Add a worse edge to a non-center
-        noncenter_id = random.randrange(num_examples)
-        astral[i]["neighbors"][noncenter_id] = {"log10_e": -9999.0, "pct_identical": 50.0}
-        astral[noncenter_id]["in_neighbors"][i] = {"log10_e": -9999.0, "pct_identical": 50.0}
-    return astral
-
-
-
-#############################
-# Numscop
-#############################
-def numscop(astral, seq_ids, scop_level):
-    return len({list(astral[seq_id]["scop"][scop_level])[0] for seq_id in seq_ids})
+###############################################################
+###############################################################
+# Submod optimization functions
+###############################################################
+###############################################################
 
 
 #############################
 # Similarity functions
 #############################
 
-def sim_from_astral(astral, sim, seq_id1, seq_id2):
-    d = astral[seq_id1]["neighbors"][seq_id2]
+def sim_from_db(db, sim, seq_id1, seq_id2):
+    d = db[seq_id1]["neighbors"][seq_id2]
     return sim_from_neighbor(sim, d)
 
 def sim_from_neighbor(sim, d):
@@ -362,15 +170,15 @@ def p90(log10_e, pct_identical):
 # Objective functions
 # -----------------
 # An objective is a dictionary
-# {"eval": astral, seq_ids, sim -> float, # The value of an objective function
-#  "diff": astral, seq_ids, sim, data -> float, # The difference in value after adding seq_id
-#  "negdiff": astral, seq_ids, sim, data -> float, # The difference in value after removing seq_id
-#  "update": astral, seq_ids, sim, data -> data, # Update the data structure to add seq_id as a representative
-#  "negupdate": astral, seq_ids, sim, data -> data, # Update the data structure to remove seq_id as a representative
-#  "base_data": astral, sim -> data, # The data structure corresponding to no representatives chosen
-#  "full_data": astral, sim -> data, # The data structure corresponding to all representatives chosen
+# {"eval": db, seq_ids, sim -> float, # The value of an objective function
+#  "diff": db, seq_ids, sim, data -> float, # The difference in value after adding seq_id
+#  "negdiff": db, seq_ids, sim, data -> float, # The difference in value after removing seq_id
+#  "update": db, seq_ids, sim, data -> data, # Update the data structure to add seq_id as a representative
+#  "negupdate": db, seq_ids, sim, data -> data, # Update the data structure to remove seq_id as a representative
+#  "base_data": db, sim -> data, # The data structure corresponding to no representatives chosen
+#  "full_data": db, sim -> data, # The data structure corresponding to all representatives chosen
 #  "name": name}
-# astral: Database
+# db: Database
 # sim: Similiarity function
 # data: function-specific data structure which may be modified over the course of an optimization algorithm
 #############################
@@ -380,10 +188,10 @@ def p90(log10_e, pct_identical):
 # AKA facility location
 ######################
 
-def summaxacross_eval(astral, seq_ids, sim):
-    max_sim = {seq_id:0 for seq_id in astral}
+def summaxacross_eval(db, seq_ids, sim):
+    max_sim = {seq_id:0 for seq_id in db}
     for chosen_seq_id in seq_ids:
-        for neighbor_seq_id, d in astral[chosen_seq_id]["in_neighbors"].items():
+        for neighbor_seq_id, d in db[chosen_seq_id]["in_neighbors"].items():
             if neighbor_seq_id in max_sim:
                 sim_val = sim(d["log10_e"], d["pct_identical"])
                 if sim_val > max_sim[neighbor_seq_id]:
@@ -392,7 +200,6 @@ def summaxacross_eval(astral, seq_ids, sim):
             else:
                 pass
                 #raise Exception("Found node with neighbor not in set")
-
     return sum(max_sim.values())
 
 # summaxacross data:
@@ -401,15 +208,15 @@ def summaxacross_eval(astral, seq_ids, sim):
 # Who each represntative represents
 # "representatives" {seq_id: {example: val}}
 
-summaxacross_base_data = lambda astral, sim: {"examples": {seq_id: (None, 0) for seq_id in astral},
+summaxacross_base_data = lambda db, sim: {"examples": {seq_id: (None, 0) for seq_id in db},
                                               "representatives": {}}
 
-summaxacross_full_data = lambda astral, sim: {"examples": {seq_id: (seq_id, sim_from_astral(astral, sim, seq_id, seq_id)) for seq_id in astral},
-                                              "representatives": {seq_id: {seq_id: sim_from_astral(astral, sim, seq_id, seq_id)} for seq_id in astral}}
+summaxacross_full_data = lambda db, sim: {"examples": {seq_id: (seq_id, sim_from_db(db, sim, seq_id, seq_id)) for seq_id in db},
+                                              "representatives": {seq_id: {seq_id: sim_from_db(db, sim, seq_id, seq_id)} for seq_id in db}}
 
-def summaxacross_diff(astral, seq_id, sim, data):
+def summaxacross_diff(db, seq_id, sim, data):
     diff = 0
-    for neighbor_seq_id, d in astral[seq_id]["in_neighbors"].items():
+    for neighbor_seq_id, d in db[seq_id]["in_neighbors"].items():
         if neighbor_seq_id in data["examples"]:
             sim_val = sim(d["log10_e"], d["pct_identical"])
             if sim_val > data["examples"][neighbor_seq_id][1]:
@@ -419,10 +226,10 @@ def summaxacross_diff(astral, seq_id, sim, data):
             #raise Exception("Found node with neighbor not in set")
     return diff
 
-def summaxacross_update(astral, seq_id, sim, data):
+def summaxacross_update(db, seq_id, sim, data):
     data = copy.deepcopy(data)
     data["representatives"][seq_id] = {}
-    for neighbor_seq_id, d in astral[seq_id]["in_neighbors"].items():
+    for neighbor_seq_id, d in db[seq_id]["in_neighbors"].items():
         if neighbor_seq_id in data["examples"]:
             sim_val = sim(d["log10_e"], d["pct_identical"])
             if sim_val > data["examples"][neighbor_seq_id][1]:
@@ -434,33 +241,33 @@ def summaxacross_update(astral, seq_id, sim, data):
     return data
 
 # O(D^2)
-def summaxacross_negdiff(astral, seq_id, sim, data):
+def summaxacross_negdiff(db, seq_id, sim, data):
     diff = 0
     # For each neighbor_seq_id that was previously represented by seq_id
     new_representatives = (set(data["representatives"].keys()) - set([seq_id]))
     for neighbor_seq_id, d in data["representatives"][seq_id].items():
         # Find the next-best representative for neighbor_seq_id
-        candidate_ids = set(astral[neighbor_seq_id]["neighbors"].keys()) & new_representatives
+        candidate_ids = set(db[neighbor_seq_id]["neighbors"].keys()) & new_representatives
         if len(candidate_ids) == 0:
             diff += -d
         else:
-            best_id = max(candidate_ids, key=lambda x: sim_from_astral(astral, sim, neighbor_seq_id, x))
-            diff += sim_from_astral(astral, sim, neighbor_seq_id, best_id) - d
+            best_id = max(candidate_ids, key=lambda x: sim_from_db(db, sim, neighbor_seq_id, x))
+            diff += sim_from_db(db, sim, neighbor_seq_id, best_id) - d
     return diff
 
 # O(D^2)
-def summaxacross_negupdate(astral, seq_id, sim, data):
+def summaxacross_negupdate(db, seq_id, sim, data):
     data = copy.deepcopy(data)
     new_representatives = (set(data["representatives"].keys()) - set([seq_id]))
     for neighbor_seq_id, d in data["representatives"][seq_id].items():
         # Find the next-best representative for neighbor_seq_id
-        candidate_ids = set(astral[neighbor_seq_id]["neighbors"].keys()) & new_representatives
+        candidate_ids = set(db[neighbor_seq_id]["neighbors"].keys()) & new_representatives
         if len(candidate_ids) == 0:
             data["examples"][neighbor_seq_id] = (None, 0)
         else:
-            best_id = max(candidate_ids, key=lambda x: sim_from_astral(astral, sim, neighbor_seq_id, x))
-            data["examples"][neighbor_seq_id] = (best_id, sim_from_astral(astral, sim, neighbor_seq_id, best_id))
-            data["representatives"][best_id][neighbor_seq_id] = sim_from_astral(astral, sim, neighbor_seq_id, best_id)
+            best_id = max(candidate_ids, key=lambda x: sim_from_db(db, sim, neighbor_seq_id, x))
+            data["examples"][neighbor_seq_id] = (best_id, sim_from_db(db, sim, neighbor_seq_id, best_id))
+            data["representatives"][best_id][neighbor_seq_id] = sim_from_db(db, sim, neighbor_seq_id, best_id)
     del data["representatives"][seq_id]
     return data
 
@@ -479,10 +286,10 @@ summaxacross = {"eval": summaxacross_eval,
 # Eval only
 ######################
 
-def minmaxacross_eval(astral, seq_ids, sim):
-    max_sim = {seq_id:0 for seq_id in astral}
+def minmaxacross_eval(db, seq_ids, sim):
+    max_sim = {seq_id:0 for seq_id in db}
     for chosen_seq_id in seq_ids:
-        for neighbor_seq_id, d in astral[chosen_seq_id]["in_neighbors"].items():
+        for neighbor_seq_id, d in db[chosen_seq_id]["in_neighbors"].items():
             if neighbor_seq_id in max_sim:
                 sim_val = sim(d["log10_e"], d["pct_identical"])
                 if sim_val > max_sim[neighbor_seq_id]:
@@ -503,11 +310,11 @@ minmaxacross = {"eval": minmaxacross_eval,
 # Eval only
 ######################
 
-def maxmaxwithin_eval(astral, seq_ids, sim):
+def maxmaxwithin_eval(db, seq_ids, sim):
     max_sim = float("-inf")
     seq_ids_set = set(seq_ids)
     for chosen_seq_id in seq_ids:
-        for neighbor_seq_id, d in astral[chosen_seq_id]["neighbors"].items():
+        for neighbor_seq_id, d in db[chosen_seq_id]["neighbors"].items():
             if neighbor_seq_id in seq_ids_set:
                 sim_val = sim(d["log10_e"], d["pct_identical"])
                 if sim_val > max_sim:
@@ -522,10 +329,10 @@ maxmaxwithin = {"eval": maxmaxwithin_eval,
 # AKA negfacloc
 ######################
 
-def summaxwithin_eval(astral, seq_ids, sim):
+def summaxwithin_eval(db, seq_ids, sim):
     max_sim = {seq_id:0 for seq_id in seq_ids}
     for chosen_seq_id in seq_ids:
-        for neighbor_seq_id, d in astral[chosen_seq_id]["in_neighbors"].items():
+        for neighbor_seq_id, d in db[chosen_seq_id]["in_neighbors"].items():
             if neighbor_seq_id == chosen_seq_id: continue
             if neighbor_seq_id in max_sim:
                 sim_val = sim(d["log10_e"], d["pct_identical"])
@@ -541,15 +348,15 @@ def summaxwithin_eval(astral, seq_ids, sim):
 # Who each represntative represents
 # "representatives" {seq_id: {example: val}}
 
-summaxwithin_base_data = lambda astral, sim: {"examples": {seq_id: (None, 0) for seq_id in astral},
+summaxwithin_base_data = lambda db, sim: {"examples": {seq_id: (None, 0) for seq_id in db},
                                               "representatives": {}}
 
-def summaxwithin_full_data(astral, sim):
+def summaxwithin_full_data(db, sim):
     data = {}
     data["examples"] = {}
-    data["representatives"] = {seq_id: {} for seq_id in astral}
-    for seq_id in astral:
-        neighbors = {neighbor_seq_id: d for neighbor_seq_id,d in astral[seq_id]["neighbors"].items() if neighbor_seq_id != seq_id}
+    data["representatives"] = {seq_id: {} for seq_id in db}
+    for seq_id in db:
+        neighbors = {neighbor_seq_id: d for neighbor_seq_id,d in db[seq_id]["neighbors"].items() if neighbor_seq_id != seq_id}
         if len(neighbors) == 0:
             data["examples"][seq_id] = (None, 0)
         else:
@@ -558,10 +365,10 @@ def summaxwithin_full_data(astral, sim):
             data["representatives"][d[0]][seq_id] = sim_from_neighbor(sim, d[1])
     return data
 
-def summaxwithin_diff(astral, seq_id, sim, data):
+def summaxwithin_diff(db, seq_id, sim, data):
     diff = 0
     # Difference introduced in other representatives
-    for neighbor_seq_id, d in astral[seq_id]["in_neighbors"].items():
+    for neighbor_seq_id, d in db[seq_id]["in_neighbors"].items():
         if neighbor_seq_id == seq_id: continue
         if neighbor_seq_id in data["representatives"]:
             sim_val = sim(d["log10_e"], d["pct_identical"])
@@ -569,7 +376,7 @@ def summaxwithin_diff(astral, seq_id, sim, data):
                 # adding a penalty of sim_val, removing old penalty
                 diff -= sim_val - data["examples"][neighbor_seq_id][1]
     # Difference from adding this representative
-    neighbors = {neighbor_seq_id: d for neighbor_seq_id,d in astral[seq_id]["neighbors"].items() if neighbor_seq_id != seq_id}
+    neighbors = {neighbor_seq_id: d for neighbor_seq_id,d in db[seq_id]["neighbors"].items() if neighbor_seq_id != seq_id}
     if len(neighbors) == 0:
         diff -= 0
     else:
@@ -577,19 +384,19 @@ def summaxwithin_diff(astral, seq_id, sim, data):
         diff -= sim_from_neighbor(sim, d[1])
     return diff
 
-def summaxwithin_update(astral, seq_id, sim, data):
+def summaxwithin_update(db, seq_id, sim, data):
     data = copy.deepcopy(data)
     # Find best repr for seq_id
-    candidate_ids = (set(astral[seq_id]["neighbors"].keys()) & set(data["representatives"].keys())) - set([seq_id])
+    candidate_ids = (set(db[seq_id]["neighbors"].keys()) & set(data["representatives"].keys())) - set([seq_id])
     if len(candidate_ids) == 0:
         data["examples"][seq_id] = (None, 0)
     else:
-        best_id = max(candidate_ids, key=lambda x: sim_from_astral(astral, sim, seq_id, x))
-        data["examples"][seq_id] = (best_id, sim_from_astral(astral, sim, seq_id, best_id))
-        data["representatives"][best_id][seq_id] = sim_from_astral(astral, sim, seq_id, best_id)
+        best_id = max(candidate_ids, key=lambda x: sim_from_db(db, sim, seq_id, x))
+        data["examples"][seq_id] = (best_id, sim_from_db(db, sim, seq_id, best_id))
+        data["representatives"][best_id][seq_id] = sim_from_db(db, sim, seq_id, best_id)
     # Find ids represented by seq_id
     data["representatives"][seq_id] = {}
-    for neighbor_seq_id, d in astral[seq_id]["in_neighbors"].items():
+    for neighbor_seq_id, d in db[seq_id]["in_neighbors"].items():
         if neighbor_seq_id in data["examples"]:
             if neighbor_seq_id == seq_id: continue
             sim_val = sim(d["log10_e"], d["pct_identical"])
@@ -602,38 +409,38 @@ def summaxwithin_update(astral, seq_id, sim, data):
     return data
 
 # O(D^2)
-def summaxwithin_negdiff(astral, seq_id, sim, data):
+def summaxwithin_negdiff(db, seq_id, sim, data):
     diff = 0
     # Difference introduced in other representatives
     # For each neighbor_seq_id that was previously represented by seq_id
     new_representatives = (set(data["representatives"].keys()) - set([seq_id]))
     for neighbor_seq_id, d in data["representatives"][seq_id].items():
         # Find the next-best representative for neighbor_seq_id
-        candidate_ids = set(astral[neighbor_seq_id]["neighbors"].keys()) & new_representatives
+        candidate_ids = set(db[neighbor_seq_id]["neighbors"].keys()) & new_representatives
         if len(candidate_ids) == 0:
             diff += d # removing a penalty of -d
         else:
-            best_id = max(candidate_ids, key=lambda x: sim_from_astral(astral, sim, neighbor_seq_id, x))
+            best_id = max(candidate_ids, key=lambda x: sim_from_db(db, sim, neighbor_seq_id, x))
             # removing a penalty of d, adding a new penalty of -sim(neighbor, best)
-            diff += d - sim_from_astral(astral, sim, neighbor_seq_id, best_id)
+            diff += d - sim_from_db(db, sim, neighbor_seq_id, best_id)
     # Difference from adding this representative
     diff += data["examples"][seq_id][1] # removing a penalty of -sim
     return diff
 
 # O(D^2)
-def summaxwithin_negupdate(astral, seq_id, sim, data):
+def summaxwithin_negupdate(db, seq_id, sim, data):
     data = copy.deepcopy(data)
     del data["examples"][seq_id]
     new_representatives = (set(data["representatives"].keys()) - set([seq_id]))
     for neighbor_seq_id, d in data["representatives"][seq_id].items():
         # Find the next-best representative for neighbor_seq_id
-        candidate_ids = set(astral[neighbor_seq_id]["neighbors"].keys()) & new_representatives
+        candidate_ids = set(db[neighbor_seq_id]["neighbors"].keys()) & new_representatives
         if len(candidate_ids) == 0:
             data["examples"][neighbor_seq_id] = (None, 0)
         else:
-            best_id = max(candidate_ids, key=lambda x: sim_from_astral(astral, sim, neighbor_seq_id, x))
-            data["examples"][neighbor_seq_id] = (best_id, sim_from_astral(astral, sim, neighbor_seq_id, best_id))
-            data["representatives"][best_id][neighbor_seq_id] = sim_from_astral(astral, sim, neighbor_seq_id, best_id)
+            best_id = max(candidate_ids, key=lambda x: sim_from_db(db, sim, neighbor_seq_id, x))
+            data["examples"][neighbor_seq_id] = (best_id, sim_from_db(db, sim, neighbor_seq_id, best_id))
+            data["representatives"][best_id][neighbor_seq_id] = sim_from_db(db, sim, neighbor_seq_id, best_id)
     del data["representatives"][seq_id]
     return data
 
@@ -651,64 +458,64 @@ summaxwithin = {"eval": summaxwithin_eval,
 # sumsumwithin
 ######################
 
-def bisim(astral, sim, seq_id1, seq_id2):
+def bisim(db, sim, seq_id1, seq_id2):
     ret = 0
-    if seq_id2 in astral[seq_id1]["neighbors"]:
-        d = astral[seq_id1]["neighbors"][seq_id2]
+    if seq_id2 in db[seq_id1]["neighbors"]:
+        d = db[seq_id1]["neighbors"][seq_id2]
         ret += sim(d["log10_e"], d["pct_identical"])
-    if seq_id1 in astral[seq_id2]["neighbors"]:
-        d = astral[seq_id2]["neighbors"][seq_id1]
+    if seq_id1 in db[seq_id2]["neighbors"]:
+        d = db[seq_id2]["neighbors"][seq_id1]
         ret += sim(d["log10_e"], d["pct_identical"])
     return ret
 
-def sumsumwithin_eval(astral, seq_ids, sim):
+def sumsumwithin_eval(db, seq_ids, sim):
     seq_ids = set(seq_ids)
     s = 0
     for chosen_id in seq_ids:
-        for neighbor, d in astral[chosen_id]["neighbors"].items():
+        for neighbor, d in db[chosen_id]["neighbors"].items():
             if chosen_id == neighbor: continue
             if neighbor in seq_ids:
                 s += -sim(d["log10_e"], d["pct_identical"])
     return s
 
-sumsumwithin_base_data = lambda astral, sim: set()
-sumsumwithin_full_data = lambda astral, sim: set(astral.keys())
+sumsumwithin_base_data = lambda db, sim: set()
+sumsumwithin_full_data = lambda db, sim: set(db.keys())
 
-def sumsumwithin_diff(astral, seq_id, sim, data):
+def sumsumwithin_diff(db, seq_id, sim, data):
     diff = 0
     data = data | set([seq_id])
-    for neighbor, d in astral[seq_id]["neighbors"].items():
+    for neighbor, d in db[seq_id]["neighbors"].items():
         if seq_id == neighbor: continue
         if not (neighbor in data): continue
         diff += -sim_from_neighbor(sim, d)
-        #neighbor_bisim = bisim(astral, sim, seq_id, neighbor)
+        #neighbor_bisim = bisim(db, sim, seq_id, neighbor)
         #diff += -neighbor_bisim
-    for neighbor, d in astral[seq_id]["in_neighbors"].items():
+    for neighbor, d in db[seq_id]["in_neighbors"].items():
         if seq_id == neighbor: continue
         if not (neighbor in data): continue
         diff += -sim_from_neighbor(sim, d)
     return diff
 
-def sumsumwithin_update(astral, seq_id, sim, data):
+def sumsumwithin_update(db, seq_id, sim, data):
     data.add(seq_id)
     return data
 
-def sumsumwithin_negdiff(astral, seq_id, sim, data):
+def sumsumwithin_negdiff(db, seq_id, sim, data):
     diff = 0
     #data = data - set([seq_id])
-    for neighbor, d in astral[seq_id]["neighbors"].items():
+    for neighbor, d in db[seq_id]["neighbors"].items():
         if seq_id == neighbor: continue
         if not (neighbor in data): continue
-        #neighbor_bisim = bisim(astral, sim, seq_id, neighbor)
+        #neighbor_bisim = bisim(db, sim, seq_id, neighbor)
         #diff -= -neighbor_bisim
         diff += sim_from_neighbor(sim, d) # removing a penalty
-    for neighbor, d in astral[seq_id]["in_neighbors"].items():
+    for neighbor, d in db[seq_id]["in_neighbors"].items():
         if seq_id == neighbor: continue
         if not (neighbor in data): continue
         diff += sim_from_neighbor(sim, d) # removing a penalty
     return diff
 
-def sumsumwithin_negupdate(astral, seq_id, sim, data):
+def sumsumwithin_negupdate(db, seq_id, sim, data):
     data.remove(seq_id)
     return data
 
@@ -725,35 +532,35 @@ sumsumwithin = {"eval": sumsumwithin_eval,
 # sumsumacross
 ######################
 
-def sumsumacross_eval(astral, seq_ids, sim):
+def sumsumacross_eval(db, seq_ids, sim):
     seq_ids = set(seq_ids)
     s = 0
     for chosen_id in seq_ids:
-        for neighbor, d in astral[chosen_id]["neighbors"].items():
+        for neighbor, d in db[chosen_id]["neighbors"].items():
             s += -sim(d["log10_e"], d["pct_identical"])
     return s
 
-sumsumacross_base_data = lambda astral, sim: None
-sumsumacross_full_data = lambda astral, sim: None
+sumsumacross_base_data = lambda db, sim: None
+sumsumacross_full_data = lambda db, sim: None
 
-def sumsumacross_diff(astral, seq_id, sim, data):
+def sumsumacross_diff(db, seq_id, sim, data):
     diff = 0
-    for neighbor, d in astral[seq_id]["neighbors"].items():
+    for neighbor, d in db[seq_id]["neighbors"].items():
         if seq_id == neighbor: continue
         diff += -sim(d["log10_e"], d["pct_identical"])
     return diff
 
-def sumsumacross_negdiff(astral, seq_id, sim, data):
+def sumsumacross_negdiff(db, seq_id, sim, data):
     diff = 0
-    for neighbor, d in astral[seq_id]["neighbors"].items():
+    for neighbor, d in db[seq_id]["neighbors"].items():
         if seq_id == neighbor: continue
         diff -= -sim(d["log10_e"], d["pct_identical"])
     return diff
 
-def sumsumacross_update(astral, seq_id, sim, data):
+def sumsumacross_update(db, seq_id, sim, data):
     raise Exception("Not used")
 
-def sumsumacross_negupdate(astral, seq_id, sim, data):
+def sumsumacross_negupdate(db, seq_id, sim, data):
     raise Exception("Not used")
 
 sumsumacross = {"eval": sumsumacross_eval,
@@ -804,46 +611,46 @@ class MixtureObjective(object):
             all_contain = all_contain and (item in objective)
         return all_contain
 
-    def eval(self, astral, seq_ids, sims):
+    def eval(self, db, seq_ids, sims):
         s = 0
         for i, objective in enumerate(self.objectives):
-            s += self.weights[i]*objective["eval"](astral, seq_ids, sims[i])
+            s += self.weights[i]*objective["eval"](db, seq_ids, sims[i])
         return s
 
-    def diff(self, astral, seq_id, sims, datas):
+    def diff(self, db, seq_id, sims, datas):
         s = 0
         for i, objective in enumerate(self.objectives):
-            s += self.weights[i]*objective["diff"](astral, seq_id, sims[i], datas[i])
+            s += self.weights[i]*objective["diff"](db, seq_id, sims[i], datas[i])
         return s
 
-    def negdiff(self, astral, seq_id, sims, datas):
+    def negdiff(self, db, seq_id, sims, datas):
         s = 0
         for i, objective in enumerate(self.objectives):
-            s += self.weights[i]*objective["negdiff"](astral, seq_id, sims[i], datas[i])
+            s += self.weights[i]*objective["negdiff"](db, seq_id, sims[i], datas[i])
         return s
 
-    def update(self, astral, seq_id, sims, datas):
+    def update(self, db, seq_id, sims, datas):
         new_datas = []
         for i, objective in enumerate(self.objectives):
-            new_datas.append(objective["update"](astral, seq_id, sims[i], datas[i]))
+            new_datas.append(objective["update"](db, seq_id, sims[i], datas[i]))
         return new_datas
 
-    def negupdate(self, astral, seq_id, sims, datas):
+    def negupdate(self, db, seq_id, sims, datas):
         new_datas = []
         for i, objective in enumerate(self.objectives):
-            new_datas.append(objective["negupdate"](astral, seq_id, sims[i], datas[i]))
+            new_datas.append(objective["negupdate"](db, seq_id, sims[i], datas[i]))
         return new_datas
 
-    def base_data(self, astral, sims):
+    def base_data(self, db, sims):
         datas = []
         for i, objective in enumerate(self.objectives):
-            datas.append(objective["base_data"](astral, sims[i]))
+            datas.append(objective["base_data"](db, sims[i]))
         return datas
 
-    def full_data(self, astral, sims):
+    def full_data(self, db, sims):
         datas = []
         for i, objective in enumerate(self.objectives):
-            datas.append(objective["full_data"](astral, sims[i]))
+            datas.append(objective["full_data"](db, sims[i]))
         return datas
 
 
@@ -867,45 +674,45 @@ class MixtureObjective(object):
 
 # random selection
 # returns an order
-def random_selection(astral):
-    return random.sample(astral.keys(), len(astral.keys()))
+def random_selection(db):
+    return random.sample(db.keys(), len(db.keys()))
 
 # naive greedy selecition
 # returns an order
-def naive_greedy_selection(astral, objective, sim):
-    not_in_repset = set(astral.keys())
+def naive_greedy_selection(db, objective, sim):
+    not_in_repset = set(db.keys())
     repset = []
-    objective_data = objective["base_data"](astral, sim)
-    for iteration_index in range(len(astral.keys())):
+    objective_data = objective["base_data"](db, sim)
+    for iteration_index in range(len(db.keys())):
         if (iteration_index % 100) == 0: logger.debug("Naive Greedy iteration: %s", iteration_index)
         best_id = None
         best_diff = None
         for seq_id_index, seq_id in enumerate(not_in_repset):
-            diff = objective["diff"](astral, seq_id, sim, objective_data)
+            diff = objective["diff"](db, seq_id, sim, objective_data)
             if (best_diff is None) or (diff > best_diff):
                 best_diff = diff
                 best_id = seq_id
         repset.append(best_id)
         not_in_repset.remove(best_id)
-        objective_data = objective["update"](astral, best_id, sim, objective_data)
+        objective_data = objective["update"](db, best_id, sim, objective_data)
     return repset
 
 # returns an order
-def accelerated_greedy_selection(astral, objective, sim):
+def accelerated_greedy_selection(db, objective, sim):
     repset = []
-    pq = [(-float("inf"), seq_id) for seq_id in astral]
-    objective_data = objective["base_data"](astral, sim)
+    pq = [(-float("inf"), seq_id) for seq_id in db]
+    objective_data = objective["base_data"](db, sim)
     cur_objective = 0
     while len(pq) > 1:
         possible_diff, seq_id = heapq.heappop(pq)
-        diff = objective["diff"](astral, seq_id, sim, objective_data)
+        diff = objective["diff"](db, seq_id, sim, objective_data)
         next_possible_diff = -pq[0][0]
 
         if diff >= next_possible_diff:
             repset.append(seq_id)
-            objective_data = objective["update"](astral, seq_id, sim, objective_data)
+            objective_data = objective["update"](db, seq_id, sim, objective_data)
             cur_objective += diff
-            #assert(abs(cur_objective - objective["eval"](astral, repset, sim)) < 1e-3)
+            #assert(abs(cur_objective - objective["eval"](db, repset, sim)) < 1e-3)
             if (len(repset) % 100) == 0: logger.debug("Accelerated greedy iteration: %s", len(repset))
         else:
             heapq.heappush(pq, (-diff, seq_id))
@@ -914,47 +721,47 @@ def accelerated_greedy_selection(astral, objective, sim):
     return repset
 
 # Returns a set
-def threshold_selection(astral, objective, sim, diff_threshold, order_by_length=True):
+def threshold_selection(db, objective, sim, diff_threshold, order_by_length=True):
     repset = [] # [{"id": id, "objective": objective}]
-    objective_data = objective["base_data"](astral, sim)
+    objective_data = objective["base_data"](db, sim)
     if order_by_length:
-        seq_ids_ordered = sorted(astral.keys(), key=lambda seq_id: -len(str(astral[seq_id]["seq"])))
+        seq_ids_ordered = sorted(db.keys(), key=lambda seq_id: -len(str(db[seq_id]["seq"])))
     else:
-        seq_ids_ordered = random.sample(astral.keys(), len(astral.keys()))
+        seq_ids_ordered = random.sample(db.keys(), len(db.keys()))
     for iteration_index, seq_id in enumerate(seq_ids_ordered):
-        diff = objective["diff"](astral, seq_id, sim, objective_data)
+        diff = objective["diff"](db, seq_id, sim, objective_data)
         if diff >= diff_threshold:
             repset.append(seq_id)
-            objective_data = objective["update"](astral, seq_id, sim, objective_data)
+            objective_data = objective["update"](db, seq_id, sim, objective_data)
     return repset
 
-def nonmonotone_selection(astral, objective, sim, modular_bonus):
-    id_order = random.sample(astral.keys(), len(astral.keys()))
+def nonmonotone_selection(db, objective, sim, modular_bonus):
+    id_order = random.sample(db.keys(), len(db.keys()))
     growing_set = set()
-    shrinking_set = set(copy.deepcopy(astral.keys()))
-    growing_set_data = objective["base_data"](astral, sim)
-    shrinking_set_data = objective["full_data"](astral, sim)
-    shrinking_set_val = objective["eval"](astral, shrinking_set, sim) + modular_bonus * len(shrinking_set)
-    growing_set_val = objective["eval"](astral, growing_set, sim) + modular_bonus * len(growing_set)
+    shrinking_set = set(copy.deepcopy(db.keys()))
+    growing_set_data = objective["base_data"](db, sim)
+    shrinking_set_data = objective["full_data"](db, sim)
+    shrinking_set_val = objective["eval"](db, shrinking_set, sim) + modular_bonus * len(shrinking_set)
+    growing_set_val = objective["eval"](db, growing_set, sim) + modular_bonus * len(growing_set)
     cur_objective = 0
     for seq_id in id_order:
-        growing_imp = objective["diff"](astral, seq_id, sim, growing_set_data) + modular_bonus
-        shrinking_imp = objective["negdiff"](astral, seq_id, sim, shrinking_set_data) - modular_bonus
+        growing_imp = objective["diff"](db, seq_id, sim, growing_set_data) + modular_bonus
+        shrinking_imp = objective["negdiff"](db, seq_id, sim, shrinking_set_data) - modular_bonus
         norm_growing_imp = max(0, growing_imp)
         norm_shrinking_imp = max(0, shrinking_imp)
         if (norm_growing_imp == 0) and (norm_shrinking_imp == 0): norm_growing_imp, norm_shrinking_imp = 1,1
         if numpy.random.random() < float(norm_growing_imp) / (norm_growing_imp + norm_shrinking_imp):
             growing_set.add(seq_id)
             growing_set_val += growing_imp
-            growing_set_data = objective["update"](astral, seq_id, sim, growing_set_data)
-            #true_growing_set_val = objective["eval"](astral, growing_set, sim) + modular_bonus * len(growing_set)
+            growing_set_data = objective["update"](db, seq_id, sim, growing_set_data)
+            #true_growing_set_val = objective["eval"](db, growing_set, sim) + modular_bonus * len(growing_set)
             #if abs(growing_set_val - true_growing_set_val) > 1e-3:
                 #logger.error("Miscalculated growing_set_val! calculated: %s ; true: %s", growing_set_val, true_growing_set_val)
         else:
             shrinking_set.remove(seq_id)
             shrinking_set_val += shrinking_imp
-            shrinking_set_data = objective["negupdate"](astral, seq_id, sim, shrinking_set_data)
-            #true_shrinking_set_val = objective["eval"](astral, shrinking_set, sim) + modular_bonus * len(shrinking_set)
+            shrinking_set_data = objective["negupdate"](db, seq_id, sim, shrinking_set_data)
+            #true_shrinking_set_val = objective["eval"](db, shrinking_set, sim) + modular_bonus * len(shrinking_set)
             #if abs(shrinking_set_val - true_shrinking_set_val) > 1e-3:
                 #logger.error("Miscalculated shrinking_set_val! calculated: %s ; true: %s", shrinking_set_val, true_shrinking_set_val)
     return growing_set
@@ -964,8 +771,8 @@ def nonmonotone_selection(astral, objective, sim, modular_bonus):
 # cdhit selection
 # seqs: {seq_id: seq}
 # Returns a subset
-def cdhit_selection(astral, workdir, c=0.9):
-    seqs = {seq_id: str(astral[seq_id]["seq"]) for seq_id in astral}
+def cdhit_selection(db, workdir, c=0.9):
+    seqs = {seq_id: str(db[seq_id]["seq"]) for seq_id in db}
 
     workdir = path(workdir)
     if not workdir.exists():
@@ -1002,15 +809,15 @@ def cdhit_selection(astral, workdir, c=0.9):
 
 # Like CD-HIT, but using my own implementation
 # rather than calling the executable
-def graph_cdhit_selection(astral, sim, threshold=0.9, order_by_length=True):
+def graph_cdhit_selection(db, sim, threshold=0.9, order_by_length=True):
     repset = set()
     if order_by_length:
-        seq_ids_ordered = sorted(astral.keys(), key=lambda seq_id: -len(str(astral[seq_id]["seq"])))
+        seq_ids_ordered = sorted(db.keys(), key=lambda seq_id: -len(str(db[seq_id]["seq"])))
     else:
-        seq_ids_ordered = random.sample(astral.keys(), len(astral.keys()))
+        seq_ids_ordered = random.sample(db.keys(), len(db.keys()))
     for iteration_index, seq_id in enumerate(seq_ids_ordered):
         covered = False
-        for neighbor_seq_id, d in astral[seq_id]["neighbors"].items():
+        for neighbor_seq_id, d in db[seq_id]["neighbors"].items():
             if (neighbor_seq_id in repset) and (sim_from_neighbor(sim, d) >= threshold):
                 covered = True
                 break
@@ -1020,23 +827,23 @@ def graph_cdhit_selection(astral, sim, threshold=0.9, order_by_length=True):
 
 # Use summaxacross to get a clustering on the sequences, then pick a random
 # seq from each cluster
-def cluster_selection(astral, sim, k):
-    assert(k < len(astral.keys()))
+def cluster_selection(db, sim, k):
+    assert(k < len(db.keys()))
 
     # Use k-medioids to get a clustering
     objective = summaxacross
     cluster_centers = []
-    pq = [(-float("inf"), seq_id) for seq_id in astral]
-    objective_data = objective["base_data"](astral, sim)
+    pq = [(-float("inf"), seq_id) for seq_id in db]
+    objective_data = objective["base_data"](db, sim)
     cur_objective = 0
     while len(cluster_centers) < k:
         possible_diff, seq_id = heapq.heappop(pq)
-        diff = objective["diff"](astral, seq_id, sim, objective_data)
+        diff = objective["diff"](db, seq_id, sim, objective_data)
         next_possible_diff = -pq[0][0]
 
         if diff >= next_possible_diff:
             cluster_centers.append(seq_id)
-            objective_data = objective["update"](astral, seq_id, sim, objective_data)
+            objective_data = objective["update"](db, seq_id, sim, objective_data)
             cur_objective += diff
         else:
             heapq.heappush(pq, (-diff, seq_id))
@@ -1052,17 +859,17 @@ def cluster_selection(astral, sim, k):
     return repset
 
 # Use a clustering algorithm from sklearn
-def sklearn_cluster_selection(astral, astral_seq_ids, astral_seq_indices, sim, num_clusters_param, representative_type, cluster_type):
+def sklearn_cluster_selection(db, db_seq_ids, db_seq_indices, sim, num_clusters_param, representative_type, cluster_type):
     #logger.info("Starting sklearn_cluster_selection: representative_type {representative_type} cluster_type {cluster_type} num_clusters_param {num_clusters_param}".format(**locals()))
     # Relevant clustering methods: Affinity prop, Spectral cluster, Agglomerative clustering
     logger.info("Starting creating similarity matrix...")
     logger.info("Memory usage: %s gb", float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1000000.0 )
-    sims_matrix = numpy.zeros((len(astral), len(astral)))
-    seq_ids = astral.keys()
+    sims_matrix = numpy.zeros((len(db), len(db)))
+    seq_ids = db.keys()
     for seq_id_index, seq_id in enumerate(seq_ids):
-        for neighbor_seq_id, d in astral[seq_id]["neighbors"].items():
-            if not (neighbor_seq_id in astral): continue
-            neighbor_seq_id_index = astral_seq_indices[neighbor_seq_id]
+        for neighbor_seq_id, d in db[seq_id]["neighbors"].items():
+            if not (neighbor_seq_id in db): continue
+            neighbor_seq_id_index = db_seq_indices[neighbor_seq_id]
             s = sim_from_neighbor(sim, d)
             prev_s = sims_matrix[seq_id_index, neighbor_seq_id_index]
             if prev_s != 0:
@@ -1086,7 +893,7 @@ def sklearn_cluster_selection(astral, astral_seq_ids, astral_seq_indices, sim, n
         cluster_ids = model.fit_predict(sims_matrix)
     except ValueError:
         # Spectral clustering breaks with ValueError when you ask for more clusters than rank of the matrix supports
-        return random.sample(astral.keys(), num_clusters_param)
+        return random.sample(db.keys(), num_clusters_param)
     if numpy.isnan(cluster_ids[0]): return [] # AffinityProp sometimes breaks and just returns [nan]
     logger.info("Starting choosing repset and returning...")
     logger.info("Memory usage: %s gb", float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1000000.0 )
@@ -1097,14 +904,14 @@ def sklearn_cluster_selection(astral, astral_seq_ids, astral_seq_indices, sim, n
     repset = []
     if representative_type == "random":
         for c in cluster_ids_index:
-            repset.append(astral_seq_ids[random.choice(cluster_ids_index[c])])
+            repset.append(db_seq_ids[random.choice(cluster_ids_index[c])])
     elif representative_type == "center":
         for c in cluster_ids_index:
             center_scores = {}
-            cluster_seq_ids = set([astral_seq_ids[seq_index] for seq_index in cluster_ids_index[c]])
+            cluster_seq_ids = set([db_seq_ids[seq_index] for seq_index in cluster_ids_index[c]])
             for seq_id in cluster_seq_ids:
                 center_scores[seq_id] = sum([sim_from_neighbor(sim, d)
-                                             for neighbor_seq_id, d in astral[seq_id]["in_neighbors"].items()
+                                             for neighbor_seq_id, d in db[seq_id]["in_neighbors"].items()
                                              if (neighbor_seq_id in cluster_seq_ids)])
             best_seq_id = max(center_scores.keys(), key=lambda seq_id: center_scores[seq_id])
             repset.append(best_seq_id)
@@ -1154,4 +961,29 @@ def binary_parameter_search(f, low_x, high_x, num_iterations=30):
     for i in range(num_iterations):
         next_x, low_x, low_y, high_x, high_y = next(next_x, f(next_x), low_x, low_y, high_x, high_y)
 
+
+###############################################################
+###############################################################
+# Run optimization and output
+###############################################################
+###############################################################
+
+objective = MixtureObjective([summaxacross, sumsumwithin], [args.mixture, 1.0-args.mixture])
+logger.info("-----------------------")
+logger.info("Starting mixture of summaxacross and sumsumwithin with weight %s...", args.mixture)
+sim, sim_name = ([fraciden, fraciden], "fraciden-fraciden")
+repset_order = accelerated_greedy_selection(db, objective, sim)
+
+with open(workdir / "repset.txt", "w") as f:
+    for seq_id in repset_order:
+        f.write(seq_id)
+        f.write("\n")
+
+
+#true_rs = ["cluster_{c}_seq_0".format(**locals()) for c in range(5)]
+#obs_rs = repset_order[:5]
+#print "obs_rs:", obs_rs
+#print "Objective of intended set:", objective["eval"](db, true_rs, sim)
+#print "Objective of intended set (summaxacross-fraciden):", summaxacross["eval"](db, true_rs, fraciden)
+#print "Objective of chosen set:", objective["eval"](db, obs_rs, sim)
 
