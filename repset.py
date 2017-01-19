@@ -15,7 +15,6 @@ import copy
 import os
 import math
 import heapq
-import sklearn.cluster
 import scipy.sparse
 import resource
 
