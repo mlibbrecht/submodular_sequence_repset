@@ -15,81 +15,58 @@ import copy
 import os
 import math
 import heapq
-import scipy.sparse
 import resource
+import logging
 
+import numpy
+import scipy.sparse
+import sklearn.cluster
+import mysql.connector
 from Bio import SeqIO
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--outdir", type=path, required=True, help="Output directory")
+    parser.add_argument("--seqs", type=path, required=True, help="Input sequences, fasta format")
+    parser.add_argument("--mixture", type=float, default=0.5, help="Mixture parameter determining the relative weight of facility-location relative to sum-redundancy. Default=0.5")
+    args = parser.parse_args()
+    workdir = args.outdir
 
-###############################################################
-###############################################################
-# Input and processing
-###############################################################
-###############################################################
+    assert args.mixture >= 0.0
+    assert args.mixture <= 1.0
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--outdir", type=path, required=True, help="Output directory")
-parser.add_argument("--seqs", type=path, required=True, help="Input sequences, fasta format")
-parser.add_argument("--mixture", type=float, default=0.5, help="Mixture parameter determining the relative weight of facility-location relative to sum-redundancy. Default=0.5")
-args = parser.parse_args()
-workdir = args.outdir
+    if not workdir.exists():
+        workdir.makedirs()
 
-assert args.mixture >= 0.0
-assert args.mixture <= 1.0
+    # Logging
+    logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s")
+    logger = logging.getLogger('log')
+    logger.setLevel(logging.DEBUG)
+    # create file handler which logs even debug messages
+    fh = logging.FileHandler(workdir / "stdout.txt")
+    fh.setLevel(logging.DEBUG) # >> this determines the file level
+    # create console handler with a higher log level
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.ERROR)# >> this determines the output level
+    # create formatter and add it to the handlers
+    formatter = logging.Formatter('%(asctime)s %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    fh.setFormatter(formatter)
+    # add the handlers to logger
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+else:
+    logger = logging.getLogger('log')
 
-
-if not workdir.exists():
-    workdir.makedirs()
-
-import logging
-logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s")
-logger = logging.getLogger('log')
-logger.setLevel(logging.DEBUG)
-# create file handler which logs even debug messages
-fh = logging.FileHandler(workdir / "stdout.txt")
-fh.setLevel(logging.DEBUG) # >> this determines the file level
-# create console handler with a higher log level
-ch = logging.StreamHandler()
-ch.setLevel(logging.ERROR)# >> this determines the output level
-# create formatter and add it to the handlers
-formatter = logging.Formatter('%(asctime)s %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
-fh.setFormatter(formatter)
-# add the handlers to logger
-logger.addHandler(ch)
-logger.addHandler(fh)
-
-
-
-###################
-# Run psiblast
-###################
-if not (workdir / "db").exists():
-    cmd = ["makeblastdb",
-      "-in", args.seqs,
-      "-input_type", "fasta",
-      "-out", workdir / "db",
-      "-dbtype", "prot"]
-    logger.info(" ".join(cmd))
-    subprocess.check_call(cmd)
-
-if not (workdir / "psiblast_result.tab").exists():
-    cmd = ["psiblast",
-      "-query", args.seqs,
-      "-db", workdir / "db",
-      "-num_iterations", "6",
-      "-outfmt", "6 qseqid sseqid pident length mismatch evalue bitscore",
-      "-seg", "yes",
-      "-out", workdir / "psiblast_result.tab"
-    ]
-    logger.info(" ".join(cmd))
-    subprocess.check_call(cmd)
-
-###################
-# Read psiblast output
-###################
-
-db = {}
+############################
+# run_psiblast()
+# ---------------
+# Runs psiblast to get a similarity matrix between sequences.
+# Input:
+#   - workdir: directory for working files
+#   - seqs: fasta file with sequences
+# Output:
+#   - db with sequence and similarity information.
 # db: {seq_id: {
 #               "neighbors": {neighbor_seq_id: {"log10_e": -9999.0, "pct_identical": 100.0}},
 #               "in_neighbors": {neighbor_seq_id: {"log10_e": -9999.0, "pct_identical": 100.0}},
@@ -97,29 +74,345 @@ db = {}
 #               "seq": ""
 #             }
 #         }
+def run_psiblast(workdir, seqs):
+    # Create psiblast db
+    if not (workdir / "db").exists():
+        cmd = ["makeblastdb",
+          "-in", seqs,
+          "-input_type", "fasta",
+          "-out", workdir / "db",
+          "-dbtype", "prot"]
+        logger.info(" ".join(cmd))
+        subprocess.check_call(cmd)
+    # Run psiblast
+    if not (workdir / "psiblast_result.tab").exists():
+        cmd = ["psiblast",
+          "-query", seqs,
+          "-db", workdir / "db",
+          "-num_iterations", "6",
+          "-outfmt", "6 qseqid sseqid pident length mismatch evalue bitscore",
+          "-seg", "yes",
+          "-out", workdir / "psiblast_result.tab"
+        ]
+        logger.info(" ".join(cmd))
+        subprocess.check_call(cmd)
+    # Read psiblast output
+    db = {}
+    fasta_sequences = SeqIO.parse(open(seqs),'fasta')
+    for seq in fasta_sequences:
+        seq_id = seq.id
+        db[seq_id] = {"neighbors": {}, "in_neighbors": {}, "seq": seq.seq}
+    with open(workdir / "psiblast_result.tab", "r") as f:
+        for line in f:
+            if line.strip() == "": continue
+            if line.startswith("Search has CONVERGED!"): continue
+            line = line.split()
+            seq_id1 = line[0]
+            seq_id2 = line[1]
+            pident = float(line[2])
+            evalue = line[5]
+            log10_e = math.log10(float(evalue))
+            if float(evalue) <= 1e-2:
+                db[seq_id2]["neighbors"][seq_id1] = {"log10_e": log10_e, "pct_identical": pident}
+                db[seq_id1]["in_neighbors"][seq_id2] = {"log10_e": log10_e, "pct_identical": pident}
+    return db
 
-fasta_sequences = SeqIO.parse(open(args.seqs),'fasta')
-for seq in fasta_sequences:
-    seq_id = seq.id
-    db[seq_id] = {"neighbors": {}, "in_neighbors": {}, "seq": seq.seq}
 
-with open(workdir / "psiblast_result.tab", "r") as f:
-    for line in f:
-        if line.strip() == "": continue
-        if line.startswith("Search has CONVERGED!"): continue
-        line = line.split()
-        seq_id1 = line[0]
-        seq_id2 = line[1]
-        pident = float(line[2])
-        evalue = line[5]
-        log10_e = math.log10(float(evalue))
-        if float(evalue) <= 1e-2:
-            db[seq_id2]["neighbors"][seq_id1] = {"log10_e": log10_e, "pct_identical": pident}
-            db[seq_id1]["in_neighbors"][seq_id2] = {"log10_e": log10_e, "pct_identical": pident}
+scop_level_names = {
+    1: "Root",
+    2: "Class",
+    3: "Fold",
+    4: "Superfamily",
+    5: "Family",
+    6: "Protein",
+    7: "Species",
+    8: "PDB Entry Domain"
+}
+
+#############################
+# Read astral from database
+# Reads astral SQL database, returns db with similarity information
+# - class_id: Restrict results to a particular SCOP Class (level 2). None for no restriction.
+# - max_ids: Restrict results to max_ids ids. If class_id is also specified, will restrict number
+#      of ids first, so will result in many fewer than max_ids returned.
+# Returns:
+# astral: {seq_id: {
+#               "neighbors": {neighbor_seq_id: {"log10_e": -9999.0, "pct_identical": 100.0}},
+#               "scop": {level_id: [scop_ids]},
+#               "seq": ""
+#             }
+#         }
+#############################
+def read_astral_database(class_id=None, max_ids=None):
+    raise Exception("TODO: do not symmetrize; add in_neighbors instead")
+    time_before = time.time()
+    def connect_db(connect_timeout=30):
+        cnx = mysql.connector.connect(host="guanine.gs.washington.edu",
+                                      user="root",
+                                      port=3306,
+                                      connect_timeout=connect_timeout,
+                                      buffered=True,
+                                      get_warnings=True,
+                                      raise_on_warnings=True)
+
+        cursor = cnx.cursor(dictionary=True)
+        cursor.execute("USE scop")
+        return cnx, cursor
+
+    cnx, cursor = connect_db(connect_timeout=1200)
+
+    # is this necessary?
+    query ="SET GLOBAL max_allowed_packet=33554432"
+    logger.info(query)
+    cursor.execute(query)
+
+    query ="SET GLOBAL net_read_timeout=3600"
+    logger.info(query)
+    cursor.execute(query)
+
+    query ="SET GLOBAL net_write_timeout=3600"
+    logger.info(query)
+    cursor.execute(query)
+
+    query ="SET GLOBAL connect_timeout=3600"
+    logger.info(query)
+    cursor.execute(query)
+
+    query ="SET GLOBAL innodb_lock_wait_timeout=3600"
+    logger.info(query)
+    cursor.execute(query)
+
+    query ="SET GLOBAL innodb_flush_log_at_timeout=2000"
+    logger.info(query)
+    cursor.execute(query)
+
+    #############################
+    # Read astral ids
+    #############################
+    logger.info("Starting reading astral ids...")
+    if not (max_ids is None):
+        assert(max_ids > 0)
+        query = "SELECT id AS astral_seq_id, seq FROM astral_seq ORDER BY RAND() LIMIT {max_ids}".format(**locals())
+    else:
+        query = "SELECT id AS astral_seq_id, seq FROM astral_seq"
+
+    logger.info(query)
+    time_before = time.time()
+    cursor.execute(query)
+    astral = {row["astral_seq_id"]: {"seq": row["seq"]} for row in cursor}
+
+    logger.info("Time to read astral ids: %s", time.time()-time_before )
+
+
+    #############################
+    # Read SCOP classes
+    #############################
+    logger.info("Starting reading SCOP classes...")
+    time_before = time.time()
+    query = """
+SELECT t1.seq_id, t1.domain_id, t1.node_id, scop_node.release_id, scop_node.level_id FROM
+(
+    SELECT astral_seq.id AS seq_id, astral_domain.id AS domain_id, astral_domain.node_id AS node_id
+    FROM astral_seq
+    LEFT JOIN astral_domain ON astral_seq.id = astral_domain.seq_id
+    WHERE astral_seq.id IN ({astral_ids_str})
+) as t1
+LEFT JOIN scop_node ON t1.node_id = scop_node.id
+""".format(astral_ids_str=",".join(map(str, astral.keys())))
+    time_before_query = time.time()
+    cursor.execute(query)
+
+    # nodes_by_level: {scop_level: {seq_id: [scop_id]}}
+    nodes_by_level = {scop_level: {} for scop_level in range(1,9)}
+    num_level1 = 0
+    num_total = 0
+    for row in cursor:
+        if not ((row["level_id"] is None) or (row["level_id"] == 8)):
+            num_level1 += 1
+            num_total += 1
+            continue
+
+        if not (row["seq_id"] in nodes_by_level[8]):
+            nodes_by_level[8][row["seq_id"]] = set()
+        if row["release_id"] == 15:
+            nodes_by_level[8][row["seq_id"]].add(row["node_id"])
+            num_total += 1
+    logger.warning("Number of weird level-1-associated astral domains: %s / %s", num_level1, num_total)
+    logger.info("Time to read level-8 SCOP: %s", time.time()-time_before )
+
+    # Recursively get level 7-1 nodes
+    for scop_level in range(7,0,-1):
+        logger.info("Starting level %s...", scop_level)
+        query_nodes = set.union(*nodes_by_level[scop_level+1].values())
+        if len(query_nodes) == 0:
+            nodes_by_level[scop_level] = {seq_id: set() for seq_id in nodes_by_level[scop_level+1]}
+        else:
+            query = """
+SELECT id AS node_id, level_id, parent_node_id, description, release_id FROM
+scop_node
+WHERE id IN ({query_nodes_str}) AND release_id = 15
+""".format(query_nodes_str=",".join(map(str,query_nodes)))
+            cursor.execute(query)
+
+            nodes_reverse_index = {} # {node_id: [seq_id]}
+            for seq_id, node_list in nodes_by_level[scop_level+1].items():
+                for node_id in node_list:
+                    if not (node_id in nodes_reverse_index):
+                        nodes_reverse_index[node_id] = []
+                    nodes_reverse_index[node_id].append(seq_id)
+
+            nodes_by_level[scop_level] = {seq_id: set() for seq_id in nodes_by_level[scop_level+1]}
+            for row in cursor:
+                for seq_id in nodes_reverse_index[row["node_id"]]:
+                    nodes_by_level[scop_level][seq_id].add(row["parent_node_id"])
+
+    # convert nodes_by_level to seq_id-centric structure
+    num_skipped = 0
+    total = 0
+    for scop_level_id in nodes_by_level:
+        for seq_id in nodes_by_level[scop_level_id]:
+            if seq_id in astral:
+                if not "scop" in astral[seq_id]:
+                    astral[seq_id]["scop"] = {}
+                astral[seq_id]["scop"][scop_level_id] = nodes_by_level[scop_level_id][seq_id]
+            else:
+                num_skipped += 1
+            total += 1
+    logger.info("Converting nodes_by_level to seq_id-centric form: Skipped %s/%s entries", num_skipped, num_total)
+    logger.info("Time to read SCOP: %s", time.time()-time_before )
+
+    #############################
+    # Remove sequences with no release-15 level-5 class and restrict to class_id
+    #############################
+    logger.info("Number of sequences before removing: %s", len(astral))
+    astral = {seq_id: x for seq_id, x in astral.items() if
+              ("scop" in x and len(x["scop"][5]) >= 1)}
+
+    if not (class_id is None):
+        astral = {seq_id: x for seq_id, x in astral.items() if
+                  class_id in x["scop"][2] }
+    logger.info("Number of sequences after removing: %s", len(astral))
+
+
+    #############################
+    # Read BLAST graph
+    #############################
+    logger.info("Starting reading BLAST graph...")
+    time_before = time.time()
+    for seq_id in astral: astral[seq_id]["neighbors"] = {}
+
+    # add self-edges
+    for seq_id in astral:
+        astral[seq_id]["neighbors"][seq_id] = {"log10_e": -9999.0, "pct_identical": 100.0}
+
+    # For some reason, there seems to be a limit on the number of rows I can get in a query
+    # I'm sure there's a right way to do this, but I can't figure it out.
+    # Instead, I'm just going to break up my queries into chunks.
+    chunk_size = 10
+    cnx, cursor = connect_db(connect_timeout=10)
+    #for chunk_start in range(0, len(astral), chunk_size):
+    chunk_start = 0
+    chunk_end = chunk_start + chunk_size
+    while chunk_start < len(astral.keys()):
+        logger.info("Starting chunk %s-%s / %s", chunk_start, chunk_end, len(astral))
+        #astral_ids_chunk = astral.keys()[chunk_start:min(chunk_start+chunk_size,len(astral.keys()))]
+        astral_ids_chunk = astral.keys()[chunk_start:chunk_end]
+
+        query = """
+SELECT seq1_id, seq2_id, blast_log10_e, pct_identical FROM astral_seq_blast
+WHERE seq1_id IN ({astral_ids_chunk_str}) AND seq2_id IN ({astral_ids_str}) AND release_id = 15
+""".format(astral_ids_chunk_str=",".join(map(str, astral_ids_chunk)),
+           astral_ids_str=",".join(map(str, astral.keys())))
+        #logger.debug(query)
+        time_before_query = time.time()
+
+        try:
+            cursor.execute(query)
+            num_blast_rows = 0
+            for row_index, row in enumerate(cursor):
+                seq1_id = row["seq1_id"]
+                seq2_id = row["seq2_id"]
+                log10_e = row["blast_log10_e"]
+                pct_identical = row["pct_identical"]
+                assert(seq1_id in astral)
+                if seq2_id in astral:
+                    if seq2_id in astral[seq1_id]["neighbors"]:
+                        pass
+                        #if abs(log10_e - astral[seq1_id]["neighbors"][seq2_id]["log10_e"]) > 0.1:
+                            #logger.error("log10_e values to not match: %s vs. %s", log10_e, astral[seq1_id]["neighbors"][seq2_id]["log10_e"])
+                        #else:
+                            #logger.error("log10_e values match")
+                        #if abs(pct_identical - astral[seq1_id]["neighbors"][seq2_id]["pct_identical"]) > 0.1:
+                            #logger.error("pct_identical values to not match: %s vs. %s", pct_identical, astral[seq1_id]["neighbors"][seq2_id]["pct_identical"])
+                        #else:
+                            #logger.error("pct_identical values match")
+                    else:
+                        astral[seq1_id]["neighbors"][seq2_id] = {"log10_e": log10_e, "pct_identical": pct_identical}
+                        astral[seq2_id]["neighbors"][seq1_id] = {"log10_e": log10_e, "pct_identical": pct_identical}
+                num_blast_rows += 1
+            logger.debug("Time for query: %s (%s rows)", time.time()-time_before_query, num_blast_rows)
+            chunk_start = chunk_end
+            chunk_end = chunk_start + chunk_size
+        except mysql.connector.errors.OperationalError as e:
+            logger.warning("Ignoring error and renewing connection -- mysql.connector.errors.OperationalError: %s", e)
+            cnx, cursor = connect_db(connect_timeout=30)
+            chunk_end = chunk_start + ((chunk_end - chunk_start) // 2) + 1
+        except ValueError as e:
+            logger.warning("Ignoring error: %s", e)
+            cnx, cursor = connect_db(connect_timeout=30)
+        except IndexError as e:
+            logger.warning("Ignoring error: %s", e)
+            cnx, cursor = connect_db(connect_timeout=30)
+            chunk_end = chunk_start + ((chunk_end - chunk_start) // 2) + 1
+    logger.info("Time to read BLAST graph: %s", time.time()-time_before )
+
+    return astral
+
+# Try reading the database, starting over on failure
+def read_astral_database_retries(*args, **kwargs):
+    try:
+        read_astral_database(*args, **kwargs)
+    except Exception as e:
+        logger.critical("---- Ignoring error and restarting database read: %s ----", e)
+        read_astral_database_retries(*args, **kwargs)
+
+
+#############################
+# Synthetic astral-like database
+#############################
+def synthetic_astral(num_examples=100, num_centers=10):
+    astral = {i: {} for i in range(num_examples)}
+    # Add self-edges and filler seq and scop info
+    for i in astral:
+        astral[i]["seq"] = "AA"
+        astral[i]["neighbors"] = {i: {"log10_e": -9999.0, "pct_identical": 100.0}}
+        astral[i]["in_neighbors"] = {i: {"log10_e": -9999.0, "pct_identical": 100.0}}
+    for i in range(num_centers):
+        astral[i]["scop"] = {l:set([str(i)]) for l in scop_level_names}
+    for i in range(num_centers, num_examples):
+        # Add edge to a center
+        center_id = random.randrange(num_centers)
+        astral[i]["scop"] = astral[center_id]["scop"]
+        astral[i]["neighbors"][center_id] = {"log10_e": -9999.0, "pct_identical": 95.0}
+        astral[center_id]["in_neighbors"][i] = {"log10_e": -9999.0, "pct_identical": 95.0}
+        # Add a worse edge to a non-center
+        noncenter_id = random.randrange(num_examples)
+        astral[i]["neighbors"][noncenter_id] = {"log10_e": -9999.0, "pct_identical": 50.0}
+        astral[noncenter_id]["in_neighbors"][i] = {"log10_e": -9999.0, "pct_identical": 50.0}
+    return astral
+
+
+
+#############################
+# Numscop
+#############################
+def numscop(db, seq_ids, scop_level):
+    return len({list(db[seq_id]["scop"][scop_level])[0] for seq_id in seq_ids})
+
 
 ###############################################################
 ###############################################################
-# Submod optimization functions
+# Submodular optimization functions
 ###############################################################
 ###############################################################
 
@@ -199,6 +492,7 @@ def summaxacross_eval(db, seq_ids, sim):
             else:
                 pass
                 #raise Exception("Found node with neighbor not in set")
+
     return sum(max_sim.values())
 
 # summaxacross data:
@@ -314,7 +608,7 @@ def maxmaxwithin_eval(db, seq_ids, sim):
     seq_ids_set = set(seq_ids)
     for chosen_seq_id in seq_ids:
         for neighbor_seq_id, d in db[chosen_seq_id]["neighbors"].items():
-            if neighbor_seq_id in seq_ids_set:
+            if (neighbor_seq_id in seq_ids_set) and (neighbor_seq_id != chosen_seq_id):
                 sim_val = sim(d["log10_e"], d["pct_identical"])
                 if sim_val > max_sim:
                     max_sim = sim_val
@@ -557,10 +851,12 @@ def sumsumacross_negdiff(db, seq_id, sim, data):
     return diff
 
 def sumsumacross_update(db, seq_id, sim, data):
-    raise Exception("Not used")
+    #raise Exception("Not used")
+    return None
 
 def sumsumacross_negupdate(db, seq_id, sim, data):
-    raise Exception("Not used")
+    #raise Exception("Not used")
+    return None
 
 sumsumacross = {"eval": sumsumacross_eval,
           "diff": sumsumacross_diff,
@@ -570,6 +866,43 @@ sumsumacross = {"eval": sumsumacross_eval,
           "base_data": sumsumacross_base_data,
           "full_data": sumsumacross_full_data,
           "name": "sumsumacross"}
+
+######################
+# lengthobj
+######################
+
+def lengthobj_eval(db, seq_ids, sim):
+    s = 0
+    for chosen_id in seq_ids:
+        s += len(db[chosen_id]["seq"])
+    return s
+
+lengthobj_base_data = lambda db, sim: None
+lengthobj_full_data = lambda db, sim: None
+
+def lengthobj_diff(db, seq_id, sim, data):
+    return len(db[seq_id]["seq"])
+
+def lengthobj_negdiff(db, seq_id, sim, data):
+    return len(db[seq_id]["seq"])
+
+def lengthobj_update(db, seq_id, sim, data):
+    #raise Exception("Not used")
+    return None
+
+def lengthobj_negupdate(db, seq_id, sim, data):
+    #raise Exception("Not used")
+    return None
+
+lengthobj = {"eval": lengthobj_eval,
+          "diff": lengthobj_diff,
+          "negdiff": lengthobj_negdiff,
+          "update": lengthobj_update,
+          "negupdate": lengthobj_negupdate,
+          "base_data": lengthobj_base_data,
+          "full_data": lengthobj_full_data,
+          "name": "lengthobj"}
+
 
 
 ######################
@@ -584,6 +917,157 @@ graphcut = {"eval": lambda *args: sumsumacross_eval(*args) + sumsumwithin_eval(*
           "base_data": sumsumwithin_base_data,
           "full_data": sumsumwithin_full_data,
           "name": "graphcut"}
+
+######################
+# uniform
+######################
+def uniform_eval(db, seq_ids, sim):
+    return len(seq_ids)
+
+uniform_base_data = lambda db, sim: None
+uniform_full_data = lambda db, sim: None
+
+def uniform_diff(db, seq_id, sim, data):
+    return 1
+
+def uniform_negdiff(db, seq_id, sim, data):
+    return -1
+
+def uniform_update(db, seq_id, sim, data):
+    #raise Exception("Not used")
+    return None
+
+def uniform_negupdate(db, seq_id, sim, data):
+    #raise Exception("Not used")
+    return None
+
+uniform = {"eval": uniform_eval,
+          "diff": uniform_diff,
+          "negdiff": uniform_negdiff,
+          "update": uniform_update,
+          "negupdate": uniform_negupdate,
+          "base_data": uniform_base_data,
+          "full_data": uniform_full_data,
+          "name": "uniform"}
+
+######################
+# sumsumwithin-complement
+# XXX deprecated given complement_greedy_selection
+######################
+
+if False:
+    def sumsumwithincomp_eval(db, seq_ids, sim):
+        seq_ids = set(seq_ids)
+        complement = set(db.keys()) - seq_ids
+        s = 0
+        for comp_id in complement:
+            for neighbor, d in db[comp_id]["neighbors"].items():
+                if comp_id == neighbor: continue
+                if neighbor in complement:
+                    s += -sim(d["log10_e"], d["pct_identical"])
+        return s
+
+    sumsumwithincomp_base_data = lambda db, sim: set(db.keys())
+    sumsumwithincomp_full_data = lambda db, sim: set()
+
+    def sumsumwithincomp_diff(db, seq_id, sim, data):
+        # data: set of ids in complement
+        diff = 0
+        #data = data - set([seq_id])
+        for neighbor, d in db[seq_id]["neighbors"].items():
+            if seq_id == neighbor: continue
+            if not (neighbor in data): continue
+            diff += sim_from_neighbor(sim, d)
+        for neighbor, d in db[seq_id]["in_neighbors"].items():
+            if seq_id == neighbor: continue
+            if not (neighbor in data): continue
+            diff += sim_from_neighbor(sim, d)
+        return diff
+
+    def sumsumwithincomp_update(db, seq_id, sim, data):
+        data.remove(seq_id)
+        return data
+
+    def sumsumwithincomp_negdiff(db, seq_id, sim, data):
+        diff = 0
+        #data = data | set([seq_id])
+        for neighbor, d in db[seq_id]["neighbors"].items():
+            if seq_id == neighbor: continue
+            if not (neighbor in data): continue
+            #neighbor_bisim = bisim(db, sim, seq_id, neighbor)
+            #diff -= -neighbor_bisim
+            diff += -sim_from_neighbor(sim, d)
+        for neighbor, d in db[seq_id]["in_neighbors"].items():
+            if seq_id == neighbor: continue
+            if not (neighbor in data): continue
+            diff += -sim_from_neighbor(sim, d)
+        return diff
+
+    def sumsumwithincomp_negupdate(db, seq_id, sim, data):
+        data.add(seq_id)
+        return data
+
+    sumsumwithincomp = {"eval": sumsumwithincomp_eval,
+              "diff": sumsumwithincomp_diff,
+              "negdiff": sumsumwithincomp_negdiff,
+              "update": sumsumwithincomp_update,
+              "negupdate": sumsumwithincomp_negupdate,
+              "base_data": sumsumwithincomp_base_data,
+              "full_data": sumsumwithincomp_full_data,
+              "name": "sumsumwithincomp"}
+
+
+######################
+# Set cover objective
+######################
+
+class SetCover(object):
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.name = "setcover-" + str(self.threshold)
+
+    def __getitem__(self, key):
+        return self.__getattribute__(key)
+
+    def eval(self, db, seq_ids, sim):
+        s = 0
+        for seq_id in db:
+            for neighbor_seq_id, d in db[seq_id]["neighbors"].items():
+                if sim_from_neighbor(sim, d) >= self.threshold:
+                    s += 1
+                    break
+        return s
+
+    def diff(self, db, seq_id, sim, data):
+        s = 0
+        for neighbor_seq_id, d in db[seq_id]["in_neighbors"].items():
+            if neighbor_seq_id in data:
+                if not data[neighbor_seq_id]:
+                    if sim_from_neighbor(sim, d) >= self.threshold:
+                        s += 1
+        return s
+
+    def negdiff(self, db, seq_id, sim, data):
+        raise Exception()
+
+    def update(self, db, seq_id, sim, data):
+        for neighbor_seq_id, d in db[seq_id]["in_neighbors"].items():
+            if neighbor_seq_id in data:
+                if not data[neighbor_seq_id]:
+                    if sim_from_neighbor(sim, d) >= self.threshold:
+                        data[neighbor_seq_id] = True
+        return data
+
+    def negupdate(self, db, seq_id, sim, datas):
+        raise Exception()
+
+    def base_data(self, db, sim):
+        return {seq_id: False for seq_id in db}
+
+    def full_data(self, db, sim):
+        return {seq_id: (sim_from_db(db, sim, seq_id, seq_id) >= self.threshold)
+                for seq_id in db}
+
 
 ######################
 # MixtureObjective
@@ -697,29 +1181,84 @@ def naive_greedy_selection(db, objective, sim):
     return repset
 
 # returns an order
-def accelerated_greedy_selection(db, objective, sim):
+def accelerated_greedy_selection(db, objective, sim, max_evals=float("inf"), diff_approx_ratio=1.0, repset_size=float("inf"), target_obj_val=float("inf")):
+    assert diff_approx_ratio <= 1.0
     repset = []
     pq = [(-float("inf"), seq_id) for seq_id in db]
     objective_data = objective["base_data"](db, sim)
     cur_objective = 0
-    while len(pq) > 1:
+    num_evals = 0
+    while (len(repset) < repset_size) and (len(pq) > 1) and (cur_objective < target_obj_val):
         possible_diff, seq_id = heapq.heappop(pq)
         diff = objective["diff"](db, seq_id, sim, objective_data)
-        next_possible_diff = -pq[0][0]
-
-        if diff >= next_possible_diff:
+        next_diff = -pq[0][0]
+        num_evals += 1
+        if (num_evals >= max_evals) or (((diff - next_diff) / (abs(diff)+0.01)) >= (diff_approx_ratio - 1.0)):
             repset.append(seq_id)
             objective_data = objective["update"](db, seq_id, sim, objective_data)
             cur_objective += diff
             #assert(abs(cur_objective - objective["eval"](db, repset, sim)) < 1e-3)
-            if (len(repset) % 100) == 0: logger.debug("Accelerated greedy iteration: %s", len(repset))
+            #if (len(repset) % 100) == 0: logger.debug("Accelerated greedy iteration: %s", len(repset))
+            #print len(repset), num_evals # XXX
+            #print len(repset), cur_objective
+            num_evals = 0
         else:
             heapq.heappush(pq, (-diff, seq_id))
-
-    repset.append(pq[0][1])
+    if len(pq) == 1:
+        repset.append(pq[0][1])
     return repset
 
+def complement_greedy_selection(db, objective, sim):
+    complement_objective = {}
+    complement = lambda seq_ids: set(db.keys()) - set(seq_ids)
+    complement_objective["eval"] = lambda db, seq_ids, sim: objective["eval"](db, complement(seq_ids), sim)
+    complement_objective["diff"] = lambda db, seq_id, sim, data: objective["negdiff"](db, seq_id, sim, data)
+    complement_objective["negdiff"] = lambda db, seq_id, sim, data: objective["diff"](db, seq_id, sim, data)
+    complement_objective["update"] = lambda db, seq_id, sim, data: objective["negupdate"](db, seq_id, sim, data)
+    complement_objective["negupdate"] = lambda db, seq_id, sim, data: objective["update"](db, seq_id, sim, data)
+    complement_objective["base_data"] = lambda db, sim: objective["full_data"](db, sim)
+    complement_objective["full_data"] = lambda db, sim: objective["base_data"](db, sim)
+    repset_order = accelerated_greedy_selection(db, complement_objective, sim)
+    return repset_order[::-1]
+
+
+def stochastic_greedy_selection(db, objective, sim, sample_size, repset_size=float("inf")):
+    repset = []
+    objective_data = objective["base_data"](db, sim)
+    cur_objective = 0
+    possible = {seq_id: float("inf") for seq_id in db}
+    choosable_seq_ids = set(db.keys())
+    sample_size = int(sample_size)
+    next_log = 10
+    for iter_index in range(min(repset_size, len(db))):
+        if iter_index >= next_log:
+            if not (logger is None):
+                logger.info("stochastic_greedy_selection {} / {}".format(iter_index, min(repset_size, len(db))))
+            next_log *= 1.3
+        sample = random.sample(choosable_seq_ids, min(sample_size, len(choosable_seq_ids)))
+        sample = sorted(sample, key=lambda seq_id: possible[seq_id], reverse=True)
+        cur_best_diff = float("-inf")
+        cur_best_seq_id = None
+        for seq_id in sample:
+            if cur_best_diff >= possible[seq_id]:
+                break
+            diff = objective["diff"](db, seq_id, sim, objective_data)
+            possible[seq_id] = diff
+            if diff > cur_best_diff:
+                cur_best_diff = diff
+                cur_best_seq_id = seq_id
+        repset.append(cur_best_seq_id)
+        choosable_seq_ids.remove(cur_best_seq_id)
+        objective_data = objective["update"](db, cur_best_seq_id, sim, objective_data)
+        cur_objective += cur_best_diff
+    #assert len(repset) == len(db)
+    return repset
+
+
+
 # Returns a set
+# Like graphcdhit_selection, but works for arbitrary objectives
+# Uses objective["diff"]
 def threshold_selection(db, objective, sim, diff_threshold, order_by_length=True):
     repset = [] # [{"id": id, "objective": objective}]
     objective_data = objective["base_data"](db, sim)
@@ -727,7 +1266,12 @@ def threshold_selection(db, objective, sim, diff_threshold, order_by_length=True
         seq_ids_ordered = sorted(db.keys(), key=lambda seq_id: -len(str(db[seq_id]["seq"])))
     else:
         seq_ids_ordered = random.sample(db.keys(), len(db.keys()))
+    next_log = 10
     for iteration_index, seq_id in enumerate(seq_ids_ordered):
+        if iteration_index >= next_log:
+            if not (logger is None):
+                logger.info("threshold_selection {} / {}".format(iteration_index, len(seq_ids_ordered)))
+            next_log *= 1.3
         diff = objective["diff"](db, seq_id, sim, objective_data)
         if diff >= diff_threshold:
             repset.append(seq_id)
@@ -814,7 +1358,12 @@ def graph_cdhit_selection(db, sim, threshold=0.9, order_by_length=True):
         seq_ids_ordered = sorted(db.keys(), key=lambda seq_id: -len(str(db[seq_id]["seq"])))
     else:
         seq_ids_ordered = random.sample(db.keys(), len(db.keys()))
+    next_log = 10
     for iteration_index, seq_id in enumerate(seq_ids_ordered):
+        if iteration_index >= next_log:
+            if not (logger is None):
+                logger.info("graph_cdhit_selection {} / {}".format(iteration_index, len(seq_ids_ordered)))
+            next_log *= 1.3
         covered = False
         for neighbor_seq_id, d in db[seq_id]["neighbors"].items():
             if (neighbor_seq_id in repset) and (sim_from_neighbor(sim, d) >= threshold):
@@ -838,9 +1387,9 @@ def cluster_selection(db, sim, k):
     while len(cluster_centers) < k:
         possible_diff, seq_id = heapq.heappop(pq)
         diff = objective["diff"](db, seq_id, sim, objective_data)
-        next_possible_diff = -pq[0][0]
+        next_diff = -pq[0][0]
 
-        if diff >= next_possible_diff:
+        if diff >= next_diff:
             cluster_centers.append(seq_id)
             objective_data = objective["update"](db, seq_id, sim, objective_data)
             cur_objective += diff
@@ -918,7 +1467,69 @@ def sklearn_cluster_selection(db, db_seq_ids, db_seq_indices, sim, num_clusters_
         raise Exception("Unrecognized representative_type: {representative_type}".format(**locals()))
     return repset
 
+###############################################################
+###############################################################
+# Utility functions
+###############################################################
+###############################################################
 
+
+# Either randomly adds or removes elements from a repset
+# to match the target size
+def random_topup(db, rs, target_repset_size):
+    target_repset_size = int(target_repset_size)
+    if len(rs) > target_repset_size:
+        return random.sample(rs, target_repset_size)
+    elif len(rs) < target_repset_size:
+        return list(rs) + list(random.sample(set(db.keys()) - set(rs), target_repset_size-len(rs)))
+    else:
+        return rs
+
+#########################################
+# binary_search_repset_size
+# ----------------------------
+# Performs binary search to find a repset of size
+# exactly equal to target.
+# Usage:
+# db = input database
+# f = A function such that f(param) -> repset
+# target = target repset size
+# param_lower = lowest value of param to check. We assume that higher param <=> larger repset
+# param_upper = highest value of param to check
+# tolerance = If we find a repset of target<=size<target+tolerance, return sample(repset, target)
+# max_iters = maximum binary search iterations to attempt
+#########################################
+def binary_search_repset_size(db, f, target, param_lower, param_upper, max_iters=10, tolerance=3, final_tolerance=float("inf")):
+    # find range that includes target
+    # use iters in increments of 2 because we have to compute f() twice at each iter
+    for iter_index in range(0,int(float(max_iters)/2),2):
+        size_upper = len(f(param_upper))
+        size_lower = len(f(param_lower))
+        if (size_lower < target and size_upper < target) or (size_lower > target and size_upper > target):
+            param_upper += param_upper - param_lower
+            param_lower -= param_upper - param_lower
+        else:
+            break
+    range_search_iters = iter_index
+    # find target within range
+    for iter_index in range(range_search_iters, max_iters):
+        try_param = float(param_upper + param_lower) / 2
+        rs = f(try_param)
+        print param_lower, param_upper, try_param, len(rs), target
+        if abs(len(rs) - target) <= tolerance:
+            ret_rs = rs
+            break
+        elif len(rs) > target:
+            param_upper = try_param
+        elif len(rs) < target:
+            param_lower = try_param
+    if abs(len(rs) - final_tolerance) <= final_tolerance:
+        ret_rs = rs
+    else:
+        len_rs = len(rs)
+        raise(Exception("binary_search_repset_size failed to find a suitable param. Final parameters: param_lower={param_lower}; param_upper={param_upper}; len(rs)={len_rs}; target={target}".format(**locals())))
+    ret_rs = random_topup(db, ret_rs, target)
+    return {"rs": ret_rs, "iters": iter_index+1, "param": try_param}
 
 
 
@@ -954,11 +1565,14 @@ def binary_search_order(low_x, low_y, high_x, high_y):
 
 def binary_parameter_search(f, low_x, high_x, num_iterations=30):
     low_y = f(low_x)
+    if low_y is None:
+        raise Exception("low_y is None -- maybe faulty return value from f()")
     high_y = f(high_x)
-    next = binary_search_order(low_x, low_y, high_x, high_y)
+    get_next = binary_search_order(low_x, low_y, high_x, high_y)
     next_x = (high_x + low_x) / 2
     for i in range(num_iterations):
-        next_x, low_x, low_y, high_x, high_y = next(next_x, f(next_x), low_x, low_y, high_x, high_y)
+        next_x, low_x, low_y, high_x, high_y = get_next(next_x, f(next_x), low_x, low_y, high_x, high_y)
+
 
 
 ###############################################################
@@ -967,22 +1581,24 @@ def binary_parameter_search(f, low_x, high_x, num_iterations=30):
 ###############################################################
 ###############################################################
 
-objective = MixtureObjective([summaxacross, sumsumwithin], [args.mixture, 1.0-args.mixture])
-logger.info("-----------------------")
-logger.info("Starting mixture of summaxacross and sumsumwithin with weight %s...", args.mixture)
-sim, sim_name = ([fraciden, fraciden], "fraciden-fraciden")
-repset_order = accelerated_greedy_selection(db, objective, sim)
+if __name__ == "__main__":
+    db = run_psiblast(workdir, args.seqs)
+    objective = MixtureObjective([summaxacross, sumsumwithin], [args.mixture, 1.0-args.mixture])
+    logger.info("-----------------------")
+    logger.info("Starting mixture of summaxacross and sumsumwithin with weight %s...", args.mixture)
+    sim, sim_name = ([fraciden, fraciden], "fraciden-fraciden")
+    repset_order = accelerated_greedy_selection(db, objective, sim)
 
-with open(workdir / "repset.txt", "w") as f:
-    for seq_id in repset_order:
-        f.write(seq_id)
-        f.write("\n")
+    with open(workdir / "repset.txt", "w") as f:
+        for seq_id in repset_order:
+            f.write(seq_id)
+            f.write("\n")
 
+    #true_rs = ["cluster_{c}_seq_0".format(**locals()) for c in range(5)]
+    #obs_rs = repset_order[:5]
+    #print "obs_rs:", obs_rs
+    #print "Objective of intended set:", objective["eval"](db, true_rs, sim)
+    #print "Objective of intended set (summaxacross-fraciden):", summaxacross["eval"](db, true_rs, fraciden)
+    #print "Objective of chosen set:", objective["eval"](db, obs_rs, sim)
 
-#true_rs = ["cluster_{c}_seq_0".format(**locals()) for c in range(5)]
-#obs_rs = repset_order[:5]
-#print "obs_rs:", obs_rs
-#print "Objective of intended set:", objective["eval"](db, true_rs, sim)
-#print "Objective of intended set (summaxacross-fraciden):", summaxacross["eval"](db, true_rs, fraciden)
-#print "Objective of chosen set:", objective["eval"](db, obs_rs, sim)
 
