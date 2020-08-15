@@ -10,6 +10,7 @@ Required software:
 * BLAST+ (https://blast.ncbi.nlm.nih.gov/Blast.cgi)
 * BioPython (https://github.com/biopython/biopython.github.io/)
 * path (https://pypi.python.org/pypi/forked-path)
+* mysql-connector-python (https://pypi.org/project/mysql-connector-python/)
 
 ```
 usage: repset.py [-h] --outdir OUTDIR --seqs SEQS [--mixture MIXTURE]
