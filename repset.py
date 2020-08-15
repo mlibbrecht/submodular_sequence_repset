@@ -9,7 +9,6 @@ import math
 import random
 from path import path
 from collections import defaultdict
-import bedtools
 import shutil
 import copy
 import os
